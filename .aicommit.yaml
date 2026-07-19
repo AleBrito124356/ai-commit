@@ -1,0 +1,37 @@
+# .aicommit.yaml — configuration for this repository.
+# aicommit dogfoods its own config here. Copy this into any project (or run
+# `aicommit init`) and commit it so the whole team shares the same conventions.
+
+# Backend that generates the text: "nim" (free NVIDIA cloud) or "ollama" (local).
+backend: nim
+
+# Optional model override. Leave unset to use the backend default:
+#   nim    -> meta/llama-3.3-70b-instruct
+#   ollama -> llama3.1
+# model: qwen2.5-coder:7b
+
+# Output language for subjects and bodies: "en" or "es".
+language: en
+
+# Conventional Commit types you allow. Anything else is flagged in validation.
+allowed_types:
+  - feat
+  - fix
+  - docs
+  - style
+  - refactor
+  - perf
+  - test
+  - build
+  - ci
+  - chore
+  - revert
+
+# Hard cap on the subject line length.
+subject_max_length: 72
+
+# Prefix each message with a gitmoji for its type.
+emoji: false
+
+# Default base branch for `aicommit pr`.
+pr_base: main
