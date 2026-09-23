@@ -250,7 +250,7 @@ def _run_commit(
         )
         raise typer.Exit(0)
 
-    bundle = collect_staged()
+    bundle = collect_staged(ignore_paths=config.ignore_paths)
     diff_view = render_for_prompt(bundle, config.max_diff_chars)
     client = _make_client(config)
 
@@ -332,7 +332,7 @@ def prepare(ctx: typer.Context) -> None:
         if not is_git_repo() or not has_staged_changes():
             return
         config = load_config(cli_overrides=state.overrides)
-        bundle = collect_staged()
+        bundle = collect_staged(ignore_paths=config.ignore_paths)
         diff_view = render_for_prompt(bundle, config.max_diff_chars)
         client = LLMClient.from_config(config)
         result = generate_commit(diff_view, config, client)

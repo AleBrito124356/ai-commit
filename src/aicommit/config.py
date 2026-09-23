@@ -79,6 +79,9 @@ class Config:
     include_body: bool = True
     n_alternatives: int = 2
     temperature: float = 0.3
+    # Globs for project-specific generated files that the model should never
+    # see (they are still named in the prompt, just without content).
+    ignore_paths: List[str] = field(default_factory=list)
 
     def validate(self) -> "Config":
         if self.backend not in {"nim", "ollama"}:
@@ -91,6 +94,8 @@ class Config:
             raise ValueError("subject_max_length must be at least 20")
         if not self.allowed_types:
             raise ValueError("allowed_types must not be empty")
+        if self.max_diff_chars < 200:
+            raise ValueError("max_diff_chars must be at least 200")
         return self
 
     def with_overrides(self, **overrides: Any) -> "Config":
@@ -108,6 +113,7 @@ _COERCERS = {
     "emoji": _as_bool,
     "include_body": _as_bool,
     "allowed_types": _as_list,
+    "ignore_paths": _as_list,
 }
 
 _VALID_FIELDS = set(Config().__dict__.keys())
@@ -169,6 +175,7 @@ def _env_overrides(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         "AICOMMIT_PR_BASE": "pr_base",
         "AICOMMIT_MAX_DIFF_CHARS": "max_diff_chars",
         "AICOMMIT_TEMPERATURE": "temperature",
+        "AICOMMIT_IGNORE_PATHS": "ignore_paths",
     }
     raw = {field_name: env[var] for var, field_name in mapping.items() if env.get(var)}
     return _coerce(raw)
@@ -236,4 +243,15 @@ emoji: false
 
 # Default base branch for `aicommit pr`.
 pr_base: main
+
+# Prompt budget in characters. Bigger diffs are condensed file by file:
+# source code keeps its full patch first, data and fixtures are cut first.
+# max_diff_chars: 12000
+
+# Generated files the model should never read (still listed by name).
+# Lockfiles, binaries, minified bundles, dist/, vendor/ and files marked
+# linguist-generated in .gitattributes are already skipped automatically.
+# ignore_paths:
+#   - "src/generated/"
+#   - "*.pb.go"
 """
