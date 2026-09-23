@@ -575,7 +575,7 @@ def hook_install_cmd(
         message = hook_install(force=force)
     except (GitError, OSError, FileExistsError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {escape(message)}")
+    console.print(f"[green]✓[/] {escape(message)}", soft_wrap=True)
 
 
 @hook_app.command("uninstall")
@@ -586,7 +586,7 @@ def hook_uninstall_cmd() -> None:
         message = hook_uninstall()
     except (GitError, OSError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {escape(message)}")
+    console.print(f"[green]✓[/] {escape(message)}", soft_wrap=True)
 
 
 @hook_app.command("status")
@@ -596,26 +596,28 @@ def hook_status_cmd() -> None:
     st = hook_status()
     where = escape(str(st.path))
     if st.managed:
-        console.print(f"[green]installed[/] and managed by aicommit at {where}")
+        console.print(f"[green]installed[/] and managed by aicommit at {where}", soft_wrap=True)
     elif st.installed:
-        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {where}")
+        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {where}", soft_wrap=True)
     else:
-        console.print(f"[dim]no prepare-commit-msg hook installed[/] (hooks dir: {escape(str(st.hooks_dir))})")
+        console.print(f"[dim]no prepare-commit-msg hook installed[/] (hooks dir: {escape(str(st.hooks_dir))})", soft_wrap=True)
     if st.hooks_path_config:
         console.print(
-            f"  git runs hooks from core.hooksPath = {escape(st.hooks_path_config)}"
+            f"  git runs hooks from core.hooksPath = {escape(st.hooks_path_config)}",
+            soft_wrap=True,
         )
     if st.managed:
         if st.interpreter and st.interpreter_exists:
-            console.print(f"  runs: {escape(st.interpreter)} -m aicommit prepare")
+            console.print(f"  runs: {escape(st.interpreter)} -m aicommit prepare", soft_wrap=True)
         elif st.interpreter:
             console.print(
                 f"  [yellow]recorded interpreter is gone:[/] {escape(st.interpreter)}"
-                " — falls back to `aicommit` on PATH; reinstall with "
-                "`aicommit hook install`"
+                " - falls back to `aicommit` on PATH; reinstall with "
+                "`aicommit hook install`",
+                soft_wrap=True,
             )
         else:
-            console.print("  runs: `aicommit` from PATH")
+            console.print("  runs: `aicommit` from PATH", soft_wrap=True)
 
 
 # --------------------------------------------------------------------------- #

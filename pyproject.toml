@@ -43,6 +43,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
 ]
 
 [project.urls]
@@ -62,3 +63,13 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["src", "."]
+
+[tool.coverage.run]
+source = ["aicommit"]
+# Three lines that only run as `python -m aicommit` in a subprocess; covered
+# behaviourally by tests/test_entrypoints.py rather than by line tracing.
+omit = ["*/aicommit/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
