@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .commit import parse_commit
 from .config import Config
-from .gitutil import list_tags, run_git
+from .gitutil import list_tags, nearest_tag, run_git
 from .llm import LLMClient, extract_json
 from .prompts import changelog_polish_system, changelog_polish_user
 
@@ -68,8 +68,14 @@ class Release:
     def is_empty(self) -> bool:
         return not any(self.sections.values())
 
+    def header(self) -> str:
+        """``## [1.2.0] - 2026-07-19``; Unreleased has no date (Keep a Changelog)."""
+        if self.version.lower() == "unreleased":
+            return "## [Unreleased]"
+        return f"## [{self.version}] - {self.date}"
+
     def render(self) -> str:
-        lines = [f"## [{self.version}] - {self.date}"]
+        lines = [self.header()]
         for section in SECTION_ORDER:
             entries = self.sections.get(section)
             if not entries:
@@ -103,7 +109,8 @@ def group_commits(
     """Bucket parsed commits into Keep a Changelog sections.
 
     ``commits`` is a list of ``{"hash": ..., "message": ...}`` dicts. Merge
-    commits and messages that are not Conventional Commits are skipped.
+    commits and messages that are not Conventional Commits are skipped. A
+    leading gitmoji (what ``aicommit --emoji`` writes) is understood.
     """
     grouped: "OrderedDict[str, List[ChangelogEntry]]" = OrderedDict(
         (section, []) for section in SECTION_ORDER
@@ -178,7 +185,7 @@ def _polish(release: Release, config: Config, client: LLMClient) -> None:
     system = changelog_polish_system(config)
     user = changelog_polish_user([e.text for e in flat])
     raw = client.complete(system, user, temperature=0.2, max_tokens=1200)
-    data = extract_json(raw)
+    data = extract_json(raw, expected_keys=("entries",))
     rewritten = data.get("entries", [])
     for entry, new_text in zip(flat, rewritten):
         if isinstance(new_text, str) and new_text.strip():
@@ -205,15 +212,11 @@ def generate_release_notes(
         release_date=release_date,
         include_internal=include_internal,
     )
-    if resolved_version == "Unreleased" and release_date is None:
-        release.date = date.today().isoformat()
-
     if polish and client is not None and config is not None:
         _polish(release, config, client)
 
     if release.is_empty:
-        header = f"## [{release.version}] - {release.date}"
-        return f"{header}\n\n_No user-facing changes._\n"
+        return f"{release.header()}\n\n_No user-facing changes._\n"
     return release.render() + "\n"
 
 
@@ -233,6 +236,51 @@ def render_full_changelog(releases: List[str]) -> str:
     return f"{CHANGELOG_HEADER}\n{body}\n"
 
 
-def latest_tag(cwd: Optional[Path] = None) -> Optional[str]:
-    tags = list_tags(cwd=cwd)
-    return tags[-1] if tags else None
+def latest_tag(cwd: Optional[Path] = None, ref: str = "HEAD") -> Optional[str]:
+    """The release ``ref`` builds on: the nearest tag reachable from it.
+
+    Uses ``git describe``, so a backport tag created later on an older commit
+    (``v1.9.1`` after ``v2.0.0``) is not mistaken for the latest release.
+    """
+    return nearest_tag(ref, cwd=cwd)
+
+
+def generate_full_changelog(
+    config: Optional[Config] = None,
+    client: Optional[LLMClient] = None,
+    include_internal: bool = False,
+    polish: bool = False,
+    cwd: Optional[Path] = None,
+) -> str:
+    """A complete CHANGELOG.md: Unreleased, then every tag reachable from HEAD,
+    newest version first, each section covering the commits since the
+    previous version."""
+    tags = list_tags(cwd=cwd, merged_into="HEAD")
+    sections: List[str] = [
+        generate_release_notes(
+            from_tag=latest_tag(cwd=cwd),
+            to_ref="HEAD",
+            version="Unreleased",
+            config=config,
+            client=client,
+            polish=polish,
+            include_internal=include_internal,
+            cwd=cwd,
+        )
+    ]
+    for i in range(len(tags) - 1, -1, -1):
+        previous = tags[i - 1] if i > 0 else None
+        sections.append(
+            generate_release_notes(
+                from_tag=previous,
+                to_ref=tags[i],
+                version=tags[i],
+                config=config,
+                client=client,
+                polish=polish,
+                include_internal=include_internal,
+                release_date=ref_date(tags[i], cwd=cwd),
+                cwd=cwd,
+            )
+        )
+    return render_full_changelog(sections)

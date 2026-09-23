@@ -10,6 +10,7 @@ Two things every test can lean on:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,32 @@ import pytest
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+_ENV_TO_CLEAR = (
+    "NVIDIA_API_KEY",
+    "NIM_MODEL",
+    "NIM_BASE_URL",
+    "OLLAMA_HOST",
+    "OLLAMA_MODEL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_environment(monkeypatch, tmp_path_factory):
+    """Keep every test hermetic and offline.
+
+    No real ``~/.aicommit.yaml``, no API keys or Ollama host from the
+    developer's shell, and no ``AICOMMIT_*`` overrides leak into the suite.
+    """
+    from aicommit import config as config_mod
+
+    fake_home_config = tmp_path_factory.mktemp("home") / ".aicommit.yaml"
+    monkeypatch.setattr(config_mod, "user_config_path", lambda: fake_home_config)
+    for name in _ENV_TO_CLEAR:
+        monkeypatch.delenv(name, raising=False)
+    for name in list(os.environ):
+        if name.startswith("AICOMMIT_"):
+            monkeypatch.delenv(name, raising=False)
 
 
 class FakeLLMClient:
@@ -60,13 +87,15 @@ def git_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
 
-    def git(*args: str) -> str:
+    def git(*args: str, env: dict = None) -> str:
         result = subprocess.run(
             ["git", *args],
             cwd=repo,
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env={**os.environ, **env} if env else None,
         )
         return result.stdout
 

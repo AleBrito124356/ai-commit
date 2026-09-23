@@ -7,5 +7,5 @@ rich>=13.7.0       # terminal panels, tables and prompts
 httpx>=0.27.0      # HTTP client for the OpenAI-compatible chat endpoint
 PyYAML>=6.0        # parse .aicommit.yaml configuration
 
-# Development / tests only:
-#   pip install pytest>=8.0.0
+# Development / tests only (or: pip install -e ".[dev]"):
+#   pip install "pytest>=8.0.0" "pytest-cov>=5.0.0"

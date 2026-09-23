@@ -2,10 +2,11 @@
 """Run aicommit without installing it.
 
 This is a convenience shim for hacking on the tool from a checkout. Once you
-`pip install -e .` (or `pipx install .`), the `aicommit` command does the same
-thing and is what the git hook calls.
+`pip install -e .` (or `pipx install .`), the `aicommit` command and
+`python -m aicommit` (what the git hook runs) do the same thing.
 
     python cli.py            # interactive commit
+    python cli.py --backend local   # rule-based draft, no model needed
     python cli.py pr --base main
     python cli.py changelog --from v1.0.0
 """

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from aicommit.changelog import (
     build_release,
+    generate_full_changelog,
     generate_release_notes,
     group_commits,
+    latest_tag,
     render_full_changelog,
 )
+from aicommit.gitutil import list_tags
 
 COMMITS = [
     {"hash": "aaa1111", "message": "feat(api): add users endpoint"},
@@ -120,3 +125,107 @@ def test_generate_release_notes_between_tags(git_repo):
     assert "patch it" in text
     # The feature belongs to the previous release, not this range.
     assert "first feature" not in text
+
+
+# --- emoji commits, tag ordering and Keep a Changelog headers --------------- #
+
+
+def test_emoji_prefixed_commits_are_grouped():
+    commits = [
+        {"hash": "a1", "message": "✨ feat(api): add users endpoint"},
+        {"hash": "b2", "message": "\U0001f41b fix: guard nulls"},
+        {"hash": "c3", "message": ":zap: perf: cache lookups"},
+    ]
+    grouped = group_commits(commits)
+    assert [e.text for e in grouped["Added"]] == ["add users endpoint"]
+    assert grouped["Added"][0].scope == "api"
+    assert [e.text for e in grouped["Fixed"]] == ["guard nulls"]
+    assert [e.text for e in grouped["Changed"]] == ["cache lookups"]
+
+
+def test_emoji_commits_from_a_real_repo(git_repo):
+    r = git_repo
+    r.commit("✨ feat(api): add users endpoint", "api.py", "1")
+    r.commit("\U0001f41b fix: guard nulls", "api.py", "2")
+    text = generate_release_notes(version="1.0.0", cwd=r.path)
+    assert "### Added\n- **api:** add users endpoint" in text
+    assert "### Fixed\n- guard nulls" in text
+
+
+def test_unreleased_header_has_no_date(git_repo):
+    r = git_repo
+    r.commit("feat: add search", "s.py", "1")
+    text = generate_release_notes(cwd=r.path)
+    assert text.splitlines()[0] == "## [Unreleased]"
+    r2 = build_release("Unreleased", [], release_date="2026-01-01")
+    assert r2.header() == "## [Unreleased]"
+    empty = generate_release_notes(from_tag="HEAD", cwd=r.path)
+    assert empty == "## [Unreleased]\n\n_No user-facing changes._\n"
+    # Versioned releases keep their date, v-prefix untouched.
+    assert build_release("v1.2.0", [], release_date="2026-07-19").header() == (
+        "## [v1.2.0] - 2026-07-19"
+    )
+
+
+@pytest.fixture
+def backport_repo(git_repo):
+    """v2.0.0 is the newest release; v1.9.1 is a backport tagged *later* on an
+    older commit. Tag creation dates are pinned so the order is deterministic."""
+    r = git_repo
+    r.commit("feat: one", "a.py", "1")
+    r.commit("feat: two", "a.py", "2")
+    r.git("tag", "-a", "v2.0.0", "-m", "v2", env={"GIT_COMMITTER_DATE": "2026-03-01T10:00:00"})
+    r.commit("fix: three", "a.py", "3")
+    r.git(
+        "tag", "-a", "v1.9.1", "-m", "backport", "HEAD~2",
+        env={"GIT_COMMITTER_DATE": "2026-03-05T10:00:00"},
+    )
+    return r
+
+
+def test_latest_tag_is_the_nearest_reachable_not_the_newest_created(backport_repo):
+    r = backport_repo
+    # Sorting by creation date (the old behaviour) put v1.9.1 last.
+    by_date = r.git("tag", "--sort=creatordate").split()
+    assert by_date[-1] == "v1.9.1"
+    assert latest_tag(cwd=r.path) == "v2.0.0"
+    assert list_tags(cwd=r.path) == ["v1.9.1", "v2.0.0"]
+
+
+def test_already_released_commits_are_not_unreleased(backport_repo):
+    r = backport_repo
+    text = generate_release_notes(from_tag=latest_tag(cwd=r.path), cwd=r.path)
+    assert "three" in text
+    assert "two" not in text
+
+
+def test_full_changelog_sections_follow_versions(backport_repo):
+    r = backport_repo
+    text = generate_full_changelog(cwd=r.path)
+    assert text.startswith("# Changelog")
+    unreleased = text.index("## [Unreleased]")
+    v2 = text.index("## [v2.0.0]")
+    v191 = text.index("## [v1.9.1]")
+    assert unreleased < v2 < v191
+    assert "three" in text[unreleased:v2]
+    assert "two" in text[v2:v191] and "one" not in text[v2:v191]
+    assert "one" in text[v191:]
+
+
+def test_full_changelog_ignores_tags_not_reachable_from_head(git_repo):
+    r = git_repo
+    r.commit("feat: base", "a.py", "1")
+    r.git("checkout", "-q", "-b", "other")
+    r.commit("feat: elsewhere", "b.py", "1")
+    r.git("tag", "v9.0.0")
+    r.git("checkout", "-q", "main")
+    r.commit("fix: here", "a.py", "2")
+    text = generate_full_changelog(cwd=r.path)
+    assert "v9.0.0" not in text
+    assert "here" in text
+
+
+def test_latest_tag_without_tags_is_none(git_repo):
+    r = git_repo
+    r.commit("feat: x", "a.py", "1")
+    assert latest_tag(cwd=r.path) is None

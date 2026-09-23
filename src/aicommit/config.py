@@ -38,6 +38,9 @@ DEFAULT_TYPES: List[str] = [
 
 CONFIG_FILENAMES = (".aicommit.yaml", ".aicommit.yml")
 
+# nim: free NVIDIA cloud · ollama: local model · local: rule-based, no model.
+BACKENDS = ("nim", "ollama", "local")
+
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n"}
 
@@ -68,7 +71,7 @@ def _as_list(value: Any) -> List[str]:
 class Config:
     """Fully-resolved runtime configuration."""
 
-    backend: str = "nim"  # "nim" or "ollama"
+    backend: str = "nim"  # "nim", "ollama" or "local" (rule-based, no model)
     model: Optional[str] = None  # None -> backend default (see llm.py)
     language: str = "en"  # "en" or "es"
     allowed_types: List[str] = field(default_factory=lambda: list(DEFAULT_TYPES))
@@ -79,11 +82,17 @@ class Config:
     include_body: bool = True
     n_alternatives: int = 2
     temperature: float = 0.3
+    # Globs for project-specific generated files that the model should never
+    # see (they are still named in the prompt, just without content).
+    ignore_paths: List[str] = field(default_factory=list)
+    # When the git hook's backend fails (no key, Ollama down), prefill a
+    # rule-based draft from the local backend instead of nothing.
+    hook_fallback: bool = True
 
     def validate(self) -> "Config":
-        if self.backend not in {"nim", "ollama"}:
+        if self.backend not in BACKENDS:
             raise ValueError(
-                f"backend must be 'nim' or 'ollama', got {self.backend!r}"
+                f"backend must be 'nim', 'ollama' or 'local', got {self.backend!r}"
             )
         if self.language not in {"en", "es"}:
             raise ValueError(f"language must be 'en' or 'es', got {self.language!r}")
@@ -91,6 +100,8 @@ class Config:
             raise ValueError("subject_max_length must be at least 20")
         if not self.allowed_types:
             raise ValueError("allowed_types must not be empty")
+        if self.max_diff_chars < 200:
+            raise ValueError("max_diff_chars must be at least 200")
         return self
 
     def with_overrides(self, **overrides: Any) -> "Config":
@@ -107,7 +118,9 @@ _COERCERS = {
     "temperature": float,
     "emoji": _as_bool,
     "include_body": _as_bool,
+    "hook_fallback": _as_bool,
     "allowed_types": _as_list,
+    "ignore_paths": _as_list,
 }
 
 _VALID_FIELDS = set(Config().__dict__.keys())
@@ -169,6 +182,8 @@ def _env_overrides(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         "AICOMMIT_PR_BASE": "pr_base",
         "AICOMMIT_MAX_DIFF_CHARS": "max_diff_chars",
         "AICOMMIT_TEMPERATURE": "temperature",
+        "AICOMMIT_IGNORE_PATHS": "ignore_paths",
+        "AICOMMIT_HOOK_FALLBACK": "hook_fallback",
     }
     raw = {field_name: env[var] for var, field_name in mapping.items() if env.get(var)}
     return _coerce(raw)
@@ -203,7 +218,10 @@ SAMPLE_CONFIG = """\
 # .aicommit.yaml — project configuration for aicommit
 # Commit this file so the whole team shares the same conventions.
 
-# Which backend generates the text: "nim" (free NVIDIA cloud) or "ollama" (local).
+# Which backend generates the text:
+#   nim    - free NVIDIA cloud model (needs NVIDIA_API_KEY)
+#   ollama - a model on your machine (needs `ollama serve`)
+#   local  - rule-based drafts from the diff, no model at all (not AI)
 backend: nim
 
 # Optional model override. Leave unset to use the backend default:
@@ -236,4 +254,19 @@ emoji: false
 
 # Default base branch for `aicommit pr`.
 pr_base: main
+
+# Prompt budget in characters. Bigger diffs are condensed file by file:
+# source code keeps its full patch first, data and fixtures are cut first.
+# max_diff_chars: 12000
+
+# Generated files the model should never read (still listed by name).
+# Lockfiles, binaries, minified bundles, dist/, vendor/ and files marked
+# linguist-generated in .gitattributes are already skipped automatically.
+# ignore_paths:
+#   - "src/generated/"
+#   - "*.pb.go"
+
+# If the backend fails inside the git hook, prefill a rule-based draft
+# instead of leaving the message empty.
+hook_fallback: true
 """

@@ -7,21 +7,27 @@
     aicommit prepare         # print one message to stdout (used by the hook)
     aicommit init            # write a starter .aicommit.yaml
 
+Backends: ``nim`` (free NVIDIA cloud), ``ollama`` (local model) or ``local``
+(rule-based drafts from the diff, no model and no network).
+
 The interactive commit loop lets you accept, edit, regenerate, or pick an
 alternative before anything is written.
 """
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import click
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -29,28 +35,27 @@ from rich.text import Text
 
 from . import __version__
 from .changelog import (
+    generate_full_changelog,
     generate_release_notes,
     latest_tag,
-    ref_date,
-    render_full_changelog,
 )
 from .commit import CommitMessage, generate_commit, parse_commit, validate_commit
 from .config import SAMPLE_CONFIG, Config, load_config
-from .diff import collect_staged, render_for_prompt
+from .diff import collect_staged, plan_render
 from .gitutil import (
     GitError,
     commit_with_message,
     has_staged_changes,
     is_git_repo,
-    list_tags,
     run_git,
     stage_all,
 )
 from .hook import install as hook_install
 from .hook import status as hook_status
 from .hook import uninstall as hook_uninstall
-from .llm import LLMClient, LLMError
-from .pr import generate_pr
+from .heuristic import draft_commit as local_draft_commit
+from .llm import LLMClient, LLMError, is_local_backend
+from .pr import collect_pr_context, generate_pr
 
 def _make_console(stderr: bool = False) -> Console:
     """A Rich console that stays sane on legacy Windows consoles.
@@ -87,8 +92,55 @@ class AppState:
 
 
 def _fail(message: str, code: int = 1) -> "typer.Exit":
-    err_console.print(f"[bold red]error:[/] {message}")
+    err_console.print(f"[bold red]error:[/] {escape(message)}")
     return typer.Exit(code)
+
+
+def _debug(state: AppState, message: str) -> None:
+    """--verbose output. Goes to stderr so stdout stays clean for pipes."""
+    if state.verbose:
+        err_console.print(f"[dim]{escape(message)}[/]", highlight=False)
+
+
+def _status(state: AppState, text: str):
+    """A spinner, unless --verbose is printing trace lines underneath it."""
+    if state.verbose:
+        return contextlib.nullcontext()
+    return console.status(text, spinner="dots")
+
+
+class _TracingClient:
+    """Wraps a backend and logs prompt sizes and raw replies for --verbose."""
+
+    def __init__(self, inner: Any, log: Callable[[str], None]):
+        self._inner = inner
+        self._log = log
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def complete(
+        self, system: str, user: str, temperature: float = 0.3, max_tokens: int = 1024
+    ) -> str:
+        backend = getattr(self._inner, "backend", "?")
+        model = getattr(self._inner, "model", "?")
+        self._log(
+            f"prompt -> {backend}/{model}: system {len(system):,} + user "
+            f"{len(user):,} chars, temperature {temperature}, max_tokens {max_tokens}"
+        )
+        started = time.monotonic()
+        reply = self._inner.complete(
+            system, user, temperature=temperature, max_tokens=max_tokens
+        )
+        elapsed = time.monotonic() - started
+        finish = getattr(self._inner, "last_finish_reason", None)
+        attempts = getattr(self._inner, "last_attempts", None)
+        self._log(
+            f"reply <- {len(reply or ''):,} chars in {elapsed:.1f}s"
+            f" (finish_reason={finish}, http attempts={attempts})"
+        )
+        self._log("raw reply:\n" + (reply if reply else "<empty>"))
+        return reply
 
 
 def _build_config(state: AppState) -> Config:
@@ -98,11 +150,14 @@ def _build_config(state: AppState) -> Config:
         raise _fail(str(exc))
 
 
-def _make_client(config: Config) -> LLMClient:
+def _make_client(config: Config, state: Optional[AppState] = None) -> Any:
     try:
-        return LLMClient.from_config(config)
+        client = LLMClient.from_config(config)
     except LLMError as exc:
         raise _fail(str(exc))
+    if state is not None and state.verbose:
+        return _TracingClient(client, lambda msg: _debug(state, msg))
+    return client
 
 
 def _require_repo() -> None:
@@ -120,7 +175,10 @@ def _version_callback(value: bool) -> None:
 def main(
     ctx: typer.Context,
     backend: Optional[str] = typer.Option(
-        None, "--backend", "-b", help="nim (free NVIDIA cloud) or ollama (local)."
+        None,
+        "--backend",
+        "-b",
+        help="nim (free NVIDIA cloud), ollama (local model) or local (rule-based, no AI).",
     ),
     model: Optional[str] = typer.Option(
         None, "--model", help="Override the model id for the chosen backend."
@@ -143,7 +201,12 @@ def main(
     hint: Optional[str] = typer.Option(
         None, "--hint", help="Extra guidance passed to the model (e.g. an issue id)."
     ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose errors."),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Trace to stderr: diff condensation, prompt sizes, raw model replies.",
+    ),
     _version: bool = typer.Option(
         False, "--version", callback=_version_callback, is_eager=True, help="Show version."
     ),
@@ -192,13 +255,15 @@ def _validation_lines(text: str, config: Config) -> List[str]:
     return validate_commit(msg, config)
 
 
-def _render(text: str, candidates: List[CommitMessage], config: Config) -> None:
+def _render(
+    text: str, candidates: List[CommitMessage], config: Config, rule_based: bool = False
+) -> None:
     console.print()
     console.print(
         Panel(
             Text(text.rstrip(), style="bold"),
-            title="Proposed commit",
-            border_style="cyan",
+            title="Proposed commit (rule-based draft, no AI)" if rule_based else "Proposed commit",
+            border_style="yellow" if rule_based else "cyan",
             expand=False,
         )
     )
@@ -223,6 +288,14 @@ def _render(text: str, candidates: List[CommitMessage], config: Config) -> None:
         for i, msg in enumerate(candidates, start=1):
             table.add_row(str(i), msg.header(emoji=config.emoji))
         console.print(table)
+
+
+def _report_generation(state: AppState, result: Any) -> None:
+    for note in getattr(result, "notes", []) or []:
+        _debug(state, f"normalized: {note}")
+    attempts = getattr(result, "attempts", 1)
+    if attempts > 1:
+        _debug(state, f"model calls: {attempts} (one corrective retry)")
 
 
 def _do_commit(text: str) -> None:
@@ -250,22 +323,26 @@ def _run_commit(
         )
         raise typer.Exit(0)
 
-    bundle = collect_staged()
-    diff_view = render_for_prompt(bundle, config.max_diff_chars)
-    client = _make_client(config)
+    bundle = collect_staged(ignore_paths=config.ignore_paths)
+    rendered = plan_render(bundle, config.max_diff_chars)
+    diff_view = rendered.text
+    _debug(state, rendered.describe())
+    client = _make_client(config, state)
 
     try:
-        with console.status("[cyan]Generating commit message...", spinner="dots"):
-            result = generate_commit(diff_view, config, client, hint=hint)
+        with _status(state, "[cyan]Generating commit message..."):
+            result = generate_commit(diff_view, config, client, hint=hint, bundle=bundle)
     except (LLMError, GitError) as exc:
         raise _fail(str(exc))
+    _report_generation(state, result)
+    rule_based = is_local_backend(client)
 
     candidates = result.all
     working_text = _format(candidates[0], config)
     regen_temp = min(0.9, config.temperature + 0.4)
 
     while True:
-        _render(working_text, candidates, config)
+        _render(working_text, candidates, config, rule_based=rule_based)
 
         if yes:
             break
@@ -286,13 +363,19 @@ def _run_commit(
             continue
         if action in {"r", "regen", "regenerate"}:
             try:
-                with console.status("[cyan]Regenerating...", spinner="dots"):
+                with _status(state, "[cyan]Regenerating..."):
                     result = generate_commit(
-                        diff_view, config, client, hint=hint, temperature=regen_temp
+                        diff_view,
+                        config,
+                        client,
+                        hint=hint,
+                        temperature=regen_temp,
+                        bundle=bundle,
                     )
             except LLMError as exc:
-                console.print(f"  [red]{exc}[/]")
+                console.print(f"  [red]{escape(str(exc))}[/]")
                 continue
+            _report_generation(state, result)
             candidates = result.all
             working_text = _format(candidates[0], config)
             continue
@@ -326,22 +409,34 @@ def _run_commit(
 
 @app.command()
 def prepare(ctx: typer.Context) -> None:
-    """Print one generated commit message to stdout. Silent on any failure."""
+    """Print one generated commit message to stdout. Silent on any failure.
+
+    Used by the git hook. When the configured backend fails (no key, Ollama
+    down, rate limited) and ``hook_fallback`` is on, a rule-based draft from
+    the local backend is printed instead, so the editor never opens empty.
+    """
     state: AppState = ctx.obj
     try:
         if not is_git_repo() or not has_staged_changes():
             return
         config = load_config(cli_overrides=state.overrides)
-        bundle = collect_staged()
-        diff_view = render_for_prompt(bundle, config.max_diff_chars)
-        client = LLMClient.from_config(config)
-        result = generate_commit(diff_view, config, client)
-        text = result.best.format(
-            emoji=config.emoji, include_body=config.include_body
-        )
-        sys.stdout.write(text.rstrip() + "\n")
+        bundle = collect_staged(ignore_paths=config.ignore_paths)
     except Exception:  # noqa: BLE001 - the hook must never block a commit
         return
+    try:
+        diff_view = plan_render(bundle, config.max_diff_chars).text
+        client = LLMClient.from_config(config)
+        result = generate_commit(diff_view, config, client, bundle=bundle)
+    except Exception as exc:  # noqa: BLE001 - fall back or stay silent
+        if not config.hook_fallback or config.backend == "local":
+            return
+        _debug(state, f"backend failed ({exc}); using the rule-based draft")
+        try:
+            result = local_draft_commit(bundle, config)
+        except Exception:  # noqa: BLE001
+            return
+    text = result.best.format(emoji=config.emoji, include_body=config.include_body)
+    sys.stdout.write(text.rstrip() + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -363,11 +458,24 @@ def pr(
     state: AppState = ctx.obj
     _require_repo()
     config = _build_config(state)
-    client = _make_client(config)
+    try:
+        context = collect_pr_context(base=base, config=config)
+    except GitError as exc:
+        raise _fail(str(exc))
+    _debug(
+        state,
+        f"pr: {len(context.commits)} commits on {context.head_name} vs {context.base}",
+    )
+    _debug(state, context.rendered.describe())
+    client = _make_client(config, state)
+    if is_local_backend(client):
+        err_console.print(
+            "[dim]local backend: rule-based summary of commits and diffstat, no AI[/]"
+        )
 
     try:
-        with console.status("[cyan]Summarizing branch...", spinner="dots"):
-            result = generate_pr(base=base, config=config, client=client)
+        with _status(state, "[cyan]Summarizing branch..."):
+            result = generate_pr(config=config, client=client, context=context)
     except (LLMError, GitError) as exc:
         raise _fail(str(exc))
 
@@ -414,11 +522,21 @@ def changelog(
     state: AppState = ctx.obj
     _require_repo()
     config = _build_config(state)
-    client = _make_client(config) if polish else None
+    if polish and config.backend == "local":
+        raise _fail(
+            "--polish rewrites entries with a model, and the local backend is "
+            "rule-based. Use --backend nim or --backend ollama, or drop --polish."
+        )
+    client = _make_client(config, state) if polish else None
 
     try:
         if full:
-            text = _full_changelog(config, client, include_internal, polish)
+            text = generate_full_changelog(
+                config=config,
+                client=client,
+                include_internal=include_internal,
+                polish=polish,
+            )
         else:
             start = from_tag if from_tag is not None else latest_tag()
             text = generate_release_notes(
@@ -440,43 +558,6 @@ def changelog(
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
 
 
-def _full_changelog(
-    config: Config,
-    client: Optional[LLMClient],
-    include_internal: bool,
-    polish: bool,
-) -> str:
-    tags = list_tags()
-    sections: List[str] = []
-
-    unreleased = generate_release_notes(
-        from_tag=tags[-1] if tags else None,
-        to_ref="HEAD",
-        version="Unreleased",
-        config=config,
-        client=client,
-        polish=polish,
-        include_internal=include_internal,
-    )
-    sections.append(unreleased)
-
-    for i in range(len(tags) - 1, -1, -1):
-        previous = tags[i - 1] if i > 0 else None
-        section = generate_release_notes(
-            from_tag=previous,
-            to_ref=tags[i],
-            version=tags[i],
-            config=config,
-            client=client,
-            polish=polish,
-            include_internal=include_internal,
-            release_date=ref_date(tags[i]),
-        )
-        sections.append(section)
-
-    return render_full_changelog(sections)
-
-
 # --------------------------------------------------------------------------- #
 # hook
 # --------------------------------------------------------------------------- #
@@ -494,7 +575,7 @@ def hook_install_cmd(
         message = hook_install(force=force)
     except (GitError, OSError, FileExistsError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {message}")
+    console.print(f"[green]✓[/] {escape(message)}", soft_wrap=True)
 
 
 @hook_app.command("uninstall")
@@ -505,20 +586,38 @@ def hook_uninstall_cmd() -> None:
         message = hook_uninstall()
     except (GitError, OSError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {message}")
+    console.print(f"[green]✓[/] {escape(message)}", soft_wrap=True)
 
 
 @hook_app.command("status")
 def hook_status_cmd() -> None:
-    """Report whether the hook is installed and managed by aicommit."""
+    """Report whether the hook is installed where git will actually run it."""
     _require_repo()
     st = hook_status()
+    where = escape(str(st.path))
     if st.managed:
-        console.print(f"[green]installed[/] and managed by aicommit at {st.path}")
+        console.print(f"[green]installed[/] and managed by aicommit at {where}", soft_wrap=True)
     elif st.installed:
-        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {st.path}")
+        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {where}", soft_wrap=True)
     else:
-        console.print("[dim]no prepare-commit-msg hook installed[/]")
+        console.print(f"[dim]no prepare-commit-msg hook installed[/] (hooks dir: {escape(str(st.hooks_dir))})", soft_wrap=True)
+    if st.hooks_path_config:
+        console.print(
+            f"  git runs hooks from core.hooksPath = {escape(st.hooks_path_config)}",
+            soft_wrap=True,
+        )
+    if st.managed:
+        if st.interpreter and st.interpreter_exists:
+            console.print(f"  runs: {escape(st.interpreter)} -m aicommit prepare", soft_wrap=True)
+        elif st.interpreter:
+            console.print(
+                f"  [yellow]recorded interpreter is gone:[/] {escape(st.interpreter)}"
+                " - falls back to `aicommit` on PATH; reinstall with "
+                "`aicommit hook install`",
+                soft_wrap=True,
+            )
+        else:
+            console.print("  runs: `aicommit` from PATH", soft_wrap=True)
 
 
 # --------------------------------------------------------------------------- #
