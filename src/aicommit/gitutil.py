@@ -81,13 +81,29 @@ def stage_all(cwd: Optional[Path] = None) -> None:
     run_git(["add", "-A"], cwd=cwd)
 
 
-def list_tags(cwd: Optional[Path] = None) -> List[str]:
-    """Tags ordered oldest-to-newest by the version they encode (then by date)."""
-    out = run_git(
-        ["tag", "--sort=v:refname", "--sort=creatordate"],
-        cwd=cwd,
-    )
+def list_tags(
+    cwd: Optional[Path] = None, merged_into: Optional[str] = None
+) -> List[str]:
+    """Tags ordered oldest-to-newest by the version they encode.
+
+    ``v1.9.1`` sorts before ``v2.0.0`` even if it was created later (a
+    backport). With ``merged_into``, only tags reachable from that ref are
+    returned, so a changelog for HEAD ignores tags on other branches.
+    """
+    args = ["tag", "--sort=v:refname"]
+    if merged_into:
+        args += ["--merged", merged_into]
+    out = run_git(args, cwd=cwd)
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def nearest_tag(ref: str = "HEAD", cwd: Optional[Path] = None) -> Optional[str]:
+    """The closest tag reachable from ``ref`` (``git describe``), or None."""
+    try:
+        out = run_git(["describe", "--tags", "--abbrev=0", ref], cwd=cwd)
+    except GitError:
+        return None
+    return out.strip() or None
 
 
 def rev_exists(ref: str, cwd: Optional[Path] = None) -> bool:

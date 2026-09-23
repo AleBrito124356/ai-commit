@@ -87,7 +87,7 @@ def git_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
 
-    def git(*args: str) -> str:
+    def git(*args: str, env: dict = None) -> str:
         result = subprocess.run(
             ["git", *args],
             cwd=repo,
@@ -95,6 +95,7 @@ def git_repo(tmp_path):
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env={**os.environ, **env} if env else None,
         )
         return result.stdout
 

@@ -35,10 +35,9 @@ from rich.text import Text
 
 from . import __version__
 from .changelog import (
+    generate_full_changelog,
     generate_release_notes,
     latest_tag,
-    ref_date,
-    render_full_changelog,
 )
 from .commit import CommitMessage, generate_commit, parse_commit, validate_commit
 from .config import SAMPLE_CONFIG, Config, load_config
@@ -48,7 +47,6 @@ from .gitutil import (
     commit_with_message,
     has_staged_changes,
     is_git_repo,
-    list_tags,
     run_git,
     stage_all,
 )
@@ -533,7 +531,12 @@ def changelog(
 
     try:
         if full:
-            text = _full_changelog(config, client, include_internal, polish)
+            text = generate_full_changelog(
+                config=config,
+                client=client,
+                include_internal=include_internal,
+                polish=polish,
+            )
         else:
             start = from_tag if from_tag is not None else latest_tag()
             text = generate_release_notes(
@@ -555,43 +558,6 @@ def changelog(
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
 
 
-def _full_changelog(
-    config: Config,
-    client: Optional[LLMClient],
-    include_internal: bool,
-    polish: bool,
-) -> str:
-    tags = list_tags()
-    sections: List[str] = []
-
-    unreleased = generate_release_notes(
-        from_tag=tags[-1] if tags else None,
-        to_ref="HEAD",
-        version="Unreleased",
-        config=config,
-        client=client,
-        polish=polish,
-        include_internal=include_internal,
-    )
-    sections.append(unreleased)
-
-    for i in range(len(tags) - 1, -1, -1):
-        previous = tags[i - 1] if i > 0 else None
-        section = generate_release_notes(
-            from_tag=previous,
-            to_ref=tags[i],
-            version=tags[i],
-            config=config,
-            client=client,
-            polish=polish,
-            include_internal=include_internal,
-            release_date=ref_date(tags[i]),
-        )
-        sections.append(section)
-
-    return render_full_changelog(sections)
-
-
 # --------------------------------------------------------------------------- #
 # hook
 # --------------------------------------------------------------------------- #
@@ -609,7 +575,7 @@ def hook_install_cmd(
         message = hook_install(force=force)
     except (GitError, OSError, FileExistsError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {message}")
+    console.print(f"[green]✓[/] {escape(message)}")
 
 
 @hook_app.command("uninstall")
@@ -620,20 +586,36 @@ def hook_uninstall_cmd() -> None:
         message = hook_uninstall()
     except (GitError, OSError) as exc:
         raise _fail(str(exc))
-    console.print(f"[green]✓[/] {message}")
+    console.print(f"[green]✓[/] {escape(message)}")
 
 
 @hook_app.command("status")
 def hook_status_cmd() -> None:
-    """Report whether the hook is installed and managed by aicommit."""
+    """Report whether the hook is installed where git will actually run it."""
     _require_repo()
     st = hook_status()
+    where = escape(str(st.path))
     if st.managed:
-        console.print(f"[green]installed[/] and managed by aicommit at {st.path}")
+        console.print(f"[green]installed[/] and managed by aicommit at {where}")
     elif st.installed:
-        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {st.path}")
+        console.print(f"[yellow]a hook exists but is not managed by aicommit:[/] {where}")
     else:
-        console.print("[dim]no prepare-commit-msg hook installed[/]")
+        console.print(f"[dim]no prepare-commit-msg hook installed[/] (hooks dir: {escape(str(st.hooks_dir))})")
+    if st.hooks_path_config:
+        console.print(
+            f"  git runs hooks from core.hooksPath = {escape(st.hooks_path_config)}"
+        )
+    if st.managed:
+        if st.interpreter and st.interpreter_exists:
+            console.print(f"  runs: {escape(st.interpreter)} -m aicommit prepare")
+        elif st.interpreter:
+            console.print(
+                f"  [yellow]recorded interpreter is gone:[/] {escape(st.interpreter)}"
+                " — falls back to `aicommit` on PATH; reinstall with "
+                "`aicommit hook install`"
+            )
+        else:
+            console.print("  runs: `aicommit` from PATH")
 
 
 # --------------------------------------------------------------------------- #
