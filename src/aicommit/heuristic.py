@@ -207,10 +207,12 @@ _HUNK_CONTEXT_RE = re.compile(r"^@@ [^@]* @@ ?(?P<context>.*)$")
 def enclosing_definitions(f: FileDiff) -> List[str]:
     """Names of the functions/classes that contain the changed lines.
 
-    Starts from the context git prints after ``@@`` and updates it with any
-    definition seen on an unchanged line inside the hunk, so a change in the
-    first lines of ``def login`` is attributed to ``login`` even when git had
-    no earlier line to show as hunk context.
+    Starts from the context git prints after ``@@`` and updates it with every
+    definition seen inside the hunk, so a change in the first lines of
+    ``def login`` is attributed to ``login`` even when git had no earlier line
+    to show as hunk context. An added definition line (a new or edited
+    signature) counts as a change to that definition, and an added decorator
+    is attributed to the definition it decorates.
     """
     names: List[str] = []
     current: Optional[str] = None
@@ -228,12 +230,12 @@ def enclosing_definitions(f: FileDiff) -> List[str]:
             continue
         marker, text = line[0], line[1:]
         name = _definition_name(text)
-        if decorating and name:
-            names.append(name)
+        if name:
+            current = name  # the lines that follow belong to this definition
+            if decorating or marker == "+":
+                names.append(name)
             decorating = False
-        if marker == " " and name:
-            current = name
-        elif marker in "+-" and name is None:
+        elif marker in "+-":
             if text.strip().startswith("@"):
                 decorating = True
             elif current:

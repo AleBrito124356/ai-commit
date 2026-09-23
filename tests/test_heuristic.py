@@ -191,6 +191,19 @@ def test_enclosing_definitions_uses_context_inside_the_hunk():
     assert enclosing_definitions(parse_diff(diff).files[0]) == ["login"]
 
 
+def test_edited_signature_names_the_function():
+    diff = (
+        "diff --git a/src/shop/refunds.py b/src/shop/refunds.py\nindex 1..2 100644\n"
+        "--- a/src/shop/refunds.py\n+++ b/src/shop/refunds.py\n@@ -1,2 +1,3 @@\n"
+        "-def refund(charge_id):\n+def refund(charge_id, reason=\"\"):\n+    log(reason)\n"
+        "     return gateway.refund(charge_id)\n"
+    )
+    bundle = parse_diff(diff)
+    assert enclosing_definitions(bundle.files[0]) == ["refund"]
+    best = draft_commit(bundle, Config()).best
+    assert best.header() == "feat(refunds): update refund"
+
+
 # --- the backend object -------------------------------------------------------- #
 
 
