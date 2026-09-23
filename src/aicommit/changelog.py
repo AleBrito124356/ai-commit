@@ -178,7 +178,7 @@ def _polish(release: Release, config: Config, client: LLMClient) -> None:
     system = changelog_polish_system(config)
     user = changelog_polish_user([e.text for e in flat])
     raw = client.complete(system, user, temperature=0.2, max_tokens=1200)
-    data = extract_json(raw)
+    data = extract_json(raw, expected_keys=("entries",))
     rewritten = data.get("entries", [])
     for entry, new_text in zip(flat, rewritten):
         if isinstance(new_text, str) and new_text.strip():

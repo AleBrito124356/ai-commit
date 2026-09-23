@@ -35,13 +35,16 @@ def commit_system(config: Config) -> str:
         "lines; omit it (empty string) for trivial changes.\n"
         "- Put breaking-change notes and issue references in `footer` "
         "(e.g. 'BREAKING CHANGE: ...'), otherwise an empty string.\n"
+        "- `breaking` is the JSON boolean true only when the change breaks "
+        "existing users; otherwise false.\n"
         f"- Write all prose in {_language(config)}.\n\n"
-        "Return ONLY a JSON object with this exact shape and nothing else:\n"
+        "Return ONLY a JSON object with this exact shape and nothing else "
+        "(no prose, no code fences):\n"
         "{\n"
         '  "primary": {"type": "", "scope": null, "subject": "", '
-        '"body": "", "footer": ""},\n'
+        '"body": "", "footer": "", "breaking": false},\n'
         '  "alternatives": [{"type": "", "scope": null, "subject": "", '
-        '"body": "", "footer": ""}]\n'
+        '"body": "", "footer": "", "breaking": false}]\n'
         "}"
     )
 
@@ -56,6 +59,23 @@ def commit_user(diff_text: str, n_alternatives: int, hint: str = "") -> str:
         "```diff\n"
         f"{diff_text}\n"
         "```"
+    )
+
+
+def commit_repair_user(original_user: str, previous_reply: str, issues: List[str]) -> str:
+    """Follow-up prompt that sends validation problems back to the model once."""
+    problems = "\n".join(f"- {issue}" for issue in issues)
+    reply = previous_reply.strip()
+    if len(reply) > 1500:
+        reply = reply[:1500] + "\n...[truncated]"
+    return (
+        f"{original_user}\n\n"
+        "Your previous answer was:\n"
+        f"{reply}\n\n"
+        "It does not satisfy the rules:\n"
+        f"{problems}\n\n"
+        "Fix every problem above and answer again with ONLY the JSON object in "
+        "the exact shape requested. No prose, no code fences, no reasoning."
     )
 
 

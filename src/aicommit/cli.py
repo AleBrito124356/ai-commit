@@ -13,15 +13,18 @@ alternative before anything is written.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import click
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -36,7 +39,7 @@ from .changelog import (
 )
 from .commit import CommitMessage, generate_commit, parse_commit, validate_commit
 from .config import SAMPLE_CONFIG, Config, load_config
-from .diff import collect_staged, render_for_prompt
+from .diff import collect_staged, plan_render
 from .gitutil import (
     GitError,
     commit_with_message,
@@ -50,7 +53,7 @@ from .hook import install as hook_install
 from .hook import status as hook_status
 from .hook import uninstall as hook_uninstall
 from .llm import LLMClient, LLMError
-from .pr import generate_pr
+from .pr import collect_pr_context, generate_pr
 
 def _make_console(stderr: bool = False) -> Console:
     """A Rich console that stays sane on legacy Windows consoles.
@@ -87,8 +90,55 @@ class AppState:
 
 
 def _fail(message: str, code: int = 1) -> "typer.Exit":
-    err_console.print(f"[bold red]error:[/] {message}")
+    err_console.print(f"[bold red]error:[/] {escape(message)}")
     return typer.Exit(code)
+
+
+def _debug(state: AppState, message: str) -> None:
+    """--verbose output. Goes to stderr so stdout stays clean for pipes."""
+    if state.verbose:
+        err_console.print(f"[dim]{escape(message)}[/]", highlight=False)
+
+
+def _status(state: AppState, text: str):
+    """A spinner, unless --verbose is printing trace lines underneath it."""
+    if state.verbose:
+        return contextlib.nullcontext()
+    return console.status(text, spinner="dots")
+
+
+class _TracingClient:
+    """Wraps a backend and logs prompt sizes and raw replies for --verbose."""
+
+    def __init__(self, inner: Any, log: Callable[[str], None]):
+        self._inner = inner
+        self._log = log
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def complete(
+        self, system: str, user: str, temperature: float = 0.3, max_tokens: int = 1024
+    ) -> str:
+        backend = getattr(self._inner, "backend", "?")
+        model = getattr(self._inner, "model", "?")
+        self._log(
+            f"prompt -> {backend}/{model}: system {len(system):,} + user "
+            f"{len(user):,} chars, temperature {temperature}, max_tokens {max_tokens}"
+        )
+        started = time.monotonic()
+        reply = self._inner.complete(
+            system, user, temperature=temperature, max_tokens=max_tokens
+        )
+        elapsed = time.monotonic() - started
+        finish = getattr(self._inner, "last_finish_reason", None)
+        attempts = getattr(self._inner, "last_attempts", None)
+        self._log(
+            f"reply <- {len(reply or ''):,} chars in {elapsed:.1f}s"
+            f" (finish_reason={finish}, http attempts={attempts})"
+        )
+        self._log("raw reply:\n" + (reply if reply else "<empty>"))
+        return reply
 
 
 def _build_config(state: AppState) -> Config:
@@ -98,11 +148,14 @@ def _build_config(state: AppState) -> Config:
         raise _fail(str(exc))
 
 
-def _make_client(config: Config) -> LLMClient:
+def _make_client(config: Config, state: Optional[AppState] = None) -> Any:
     try:
-        return LLMClient.from_config(config)
+        client = LLMClient.from_config(config)
     except LLMError as exc:
         raise _fail(str(exc))
+    if state is not None and state.verbose:
+        return _TracingClient(client, lambda msg: _debug(state, msg))
+    return client
 
 
 def _require_repo() -> None:
@@ -143,7 +196,12 @@ def main(
     hint: Optional[str] = typer.Option(
         None, "--hint", help="Extra guidance passed to the model (e.g. an issue id)."
     ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose errors."),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Trace to stderr: diff condensation, prompt sizes, raw model replies.",
+    ),
     _version: bool = typer.Option(
         False, "--version", callback=_version_callback, is_eager=True, help="Show version."
     ),
@@ -225,6 +283,14 @@ def _render(text: str, candidates: List[CommitMessage], config: Config) -> None:
         console.print(table)
 
 
+def _report_generation(state: AppState, result: Any) -> None:
+    for note in getattr(result, "notes", []) or []:
+        _debug(state, f"normalized: {note}")
+    attempts = getattr(result, "attempts", 1)
+    if attempts > 1:
+        _debug(state, f"model calls: {attempts} (one corrective retry)")
+
+
 def _do_commit(text: str) -> None:
     commit_with_message(text.strip() + "\n")
     short = run_git(["rev-parse", "--short", "HEAD"]).strip()
@@ -251,14 +317,17 @@ def _run_commit(
         raise typer.Exit(0)
 
     bundle = collect_staged(ignore_paths=config.ignore_paths)
-    diff_view = render_for_prompt(bundle, config.max_diff_chars)
-    client = _make_client(config)
+    rendered = plan_render(bundle, config.max_diff_chars)
+    diff_view = rendered.text
+    _debug(state, rendered.describe())
+    client = _make_client(config, state)
 
     try:
-        with console.status("[cyan]Generating commit message...", spinner="dots"):
+        with _status(state, "[cyan]Generating commit message..."):
             result = generate_commit(diff_view, config, client, hint=hint)
     except (LLMError, GitError) as exc:
         raise _fail(str(exc))
+    _report_generation(state, result)
 
     candidates = result.all
     working_text = _format(candidates[0], config)
@@ -286,13 +355,14 @@ def _run_commit(
             continue
         if action in {"r", "regen", "regenerate"}:
             try:
-                with console.status("[cyan]Regenerating...", spinner="dots"):
+                with _status(state, "[cyan]Regenerating..."):
                     result = generate_commit(
                         diff_view, config, client, hint=hint, temperature=regen_temp
                     )
             except LLMError as exc:
-                console.print(f"  [red]{exc}[/]")
+                console.print(f"  [red]{escape(str(exc))}[/]")
                 continue
+            _report_generation(state, result)
             candidates = result.all
             working_text = _format(candidates[0], config)
             continue
@@ -333,7 +403,7 @@ def prepare(ctx: typer.Context) -> None:
             return
         config = load_config(cli_overrides=state.overrides)
         bundle = collect_staged(ignore_paths=config.ignore_paths)
-        diff_view = render_for_prompt(bundle, config.max_diff_chars)
+        diff_view = plan_render(bundle, config.max_diff_chars).text
         client = LLMClient.from_config(config)
         result = generate_commit(diff_view, config, client)
         text = result.best.format(
@@ -363,11 +433,20 @@ def pr(
     state: AppState = ctx.obj
     _require_repo()
     config = _build_config(state)
-    client = _make_client(config)
+    try:
+        context = collect_pr_context(base=base, config=config)
+    except GitError as exc:
+        raise _fail(str(exc))
+    _debug(
+        state,
+        f"pr: {len(context.commits)} commits on {context.head_name} vs {context.base}",
+    )
+    _debug(state, context.rendered.describe())
+    client = _make_client(config, state)
 
     try:
-        with console.status("[cyan]Summarizing branch...", spinner="dots"):
-            result = generate_pr(base=base, config=config, client=client)
+        with _status(state, "[cyan]Summarizing branch..."):
+            result = generate_pr(config=config, client=client, context=context)
     except (LLMError, GitError) as exc:
         raise _fail(str(exc))
 
@@ -414,7 +493,7 @@ def changelog(
     state: AppState = ctx.obj
     _require_repo()
     config = _build_config(state)
-    client = _make_client(config) if polish else None
+    client = _make_client(config, state) if polish else None
 
     try:
         if full:
