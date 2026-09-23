@@ -2,7 +2,10 @@
 # aicommit dogfoods its own config here. Copy this into any project (or run
 # `aicommit init`) and commit it so the whole team shares the same conventions.
 
-# Backend that generates the text: "nim" (free NVIDIA cloud) or "ollama" (local).
+# Backend that generates the text:
+#   nim    - free NVIDIA cloud model (needs NVIDIA_API_KEY)
+#   ollama - a model on your machine (needs `ollama serve`)
+#   local  - rule-based drafts from the diff, no model at all (not AI)
 backend: nim
 
 # Optional model override. Leave unset to use the backend default:
@@ -35,3 +38,13 @@ emoji: false
 
 # Default base branch for `aicommit pr`.
 pr_base: main
+
+# Prompt budget in characters, shared per file (source code first).
+max_diff_chars: 12000
+
+# Generated files whose content the model should never see (still named).
+# ignore_paths:
+#   - "src/generated/"
+
+# If the backend fails inside the git hook, prefill a rule-based draft.
+hook_fallback: true
