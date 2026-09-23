@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
-from .llm import LLMError, extract_json, strip_reasoning
+from .llm import LLMError, extract_json, is_local_backend, strip_reasoning
 from .prompts import commit_repair_user, commit_system, commit_user
 
 # Gitmoji-style prefix per Conventional Commit type.
@@ -613,13 +613,25 @@ def generate_commit(
     hint: str = "",
     temperature: Optional[float] = None,
     repair: bool = True,
+    bundle: Any = None,
 ) -> CommitResult:
     """Ask the model for a primary commit plus alternatives.
 
     The reply is parsed leniently and normalized. If the primary suggestion
     still fails validation, the model gets exactly one corrective call listing
     the problems; the first valid candidate across both answers wins.
+
+    With the rule-based ``local`` backend no prompt is built: the draft comes
+    straight from ``bundle`` (the parsed diff), or from ``diff_text`` parsed
+    again when no bundle is given.
     """
+    if is_local_backend(client):
+        if bundle is None:
+            from .diff import parse_diff
+
+            bundle = parse_diff(diff_text)
+        return client.draft_commit(bundle, config, hint=hint)
+
     system = commit_system(config)
     user = commit_user(diff_text, config.n_alternatives, hint=hint)
     temp = config.temperature if temperature is None else temperature

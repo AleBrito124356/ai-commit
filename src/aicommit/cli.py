@@ -7,6 +7,9 @@
     aicommit prepare         # print one message to stdout (used by the hook)
     aicommit init            # write a starter .aicommit.yaml
 
+Backends: ``nim`` (free NVIDIA cloud), ``ollama`` (local model) or ``local``
+(rule-based drafts from the diff, no model and no network).
+
 The interactive commit loop lets you accept, edit, regenerate, or pick an
 alternative before anything is written.
 """
@@ -52,7 +55,8 @@ from .gitutil import (
 from .hook import install as hook_install
 from .hook import status as hook_status
 from .hook import uninstall as hook_uninstall
-from .llm import LLMClient, LLMError
+from .heuristic import draft_commit as local_draft_commit
+from .llm import LLMClient, LLMError, is_local_backend
 from .pr import collect_pr_context, generate_pr
 
 def _make_console(stderr: bool = False) -> Console:
@@ -173,7 +177,10 @@ def _version_callback(value: bool) -> None:
 def main(
     ctx: typer.Context,
     backend: Optional[str] = typer.Option(
-        None, "--backend", "-b", help="nim (free NVIDIA cloud) or ollama (local)."
+        None,
+        "--backend",
+        "-b",
+        help="nim (free NVIDIA cloud), ollama (local model) or local (rule-based, no AI).",
     ),
     model: Optional[str] = typer.Option(
         None, "--model", help="Override the model id for the chosen backend."
@@ -250,13 +257,15 @@ def _validation_lines(text: str, config: Config) -> List[str]:
     return validate_commit(msg, config)
 
 
-def _render(text: str, candidates: List[CommitMessage], config: Config) -> None:
+def _render(
+    text: str, candidates: List[CommitMessage], config: Config, rule_based: bool = False
+) -> None:
     console.print()
     console.print(
         Panel(
             Text(text.rstrip(), style="bold"),
-            title="Proposed commit",
-            border_style="cyan",
+            title="Proposed commit (rule-based draft, no AI)" if rule_based else "Proposed commit",
+            border_style="yellow" if rule_based else "cyan",
             expand=False,
         )
     )
@@ -324,17 +333,18 @@ def _run_commit(
 
     try:
         with _status(state, "[cyan]Generating commit message..."):
-            result = generate_commit(diff_view, config, client, hint=hint)
+            result = generate_commit(diff_view, config, client, hint=hint, bundle=bundle)
     except (LLMError, GitError) as exc:
         raise _fail(str(exc))
     _report_generation(state, result)
+    rule_based = is_local_backend(client)
 
     candidates = result.all
     working_text = _format(candidates[0], config)
     regen_temp = min(0.9, config.temperature + 0.4)
 
     while True:
-        _render(working_text, candidates, config)
+        _render(working_text, candidates, config, rule_based=rule_based)
 
         if yes:
             break
@@ -357,7 +367,12 @@ def _run_commit(
             try:
                 with _status(state, "[cyan]Regenerating..."):
                     result = generate_commit(
-                        diff_view, config, client, hint=hint, temperature=regen_temp
+                        diff_view,
+                        config,
+                        client,
+                        hint=hint,
+                        temperature=regen_temp,
+                        bundle=bundle,
                     )
             except LLMError as exc:
                 console.print(f"  [red]{escape(str(exc))}[/]")
@@ -396,22 +411,34 @@ def _run_commit(
 
 @app.command()
 def prepare(ctx: typer.Context) -> None:
-    """Print one generated commit message to stdout. Silent on any failure."""
+    """Print one generated commit message to stdout. Silent on any failure.
+
+    Used by the git hook. When the configured backend fails (no key, Ollama
+    down, rate limited) and ``hook_fallback`` is on, a rule-based draft from
+    the local backend is printed instead, so the editor never opens empty.
+    """
     state: AppState = ctx.obj
     try:
         if not is_git_repo() or not has_staged_changes():
             return
         config = load_config(cli_overrides=state.overrides)
         bundle = collect_staged(ignore_paths=config.ignore_paths)
-        diff_view = plan_render(bundle, config.max_diff_chars).text
-        client = LLMClient.from_config(config)
-        result = generate_commit(diff_view, config, client)
-        text = result.best.format(
-            emoji=config.emoji, include_body=config.include_body
-        )
-        sys.stdout.write(text.rstrip() + "\n")
     except Exception:  # noqa: BLE001 - the hook must never block a commit
         return
+    try:
+        diff_view = plan_render(bundle, config.max_diff_chars).text
+        client = LLMClient.from_config(config)
+        result = generate_commit(diff_view, config, client, bundle=bundle)
+    except Exception as exc:  # noqa: BLE001 - fall back or stay silent
+        if not config.hook_fallback or config.backend == "local":
+            return
+        _debug(state, f"backend failed ({exc}); using the rule-based draft")
+        try:
+            result = local_draft_commit(bundle, config)
+        except Exception:  # noqa: BLE001
+            return
+    text = result.best.format(emoji=config.emoji, include_body=config.include_body)
+    sys.stdout.write(text.rstrip() + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -443,6 +470,10 @@ def pr(
     )
     _debug(state, context.rendered.describe())
     client = _make_client(config, state)
+    if is_local_backend(client):
+        err_console.print(
+            "[dim]local backend: rule-based summary of commits and diffstat, no AI[/]"
+        )
 
     try:
         with _status(state, "[cyan]Summarizing branch..."):
@@ -493,6 +524,11 @@ def changelog(
     state: AppState = ctx.obj
     _require_repo()
     config = _build_config(state)
+    if polish and config.backend == "local":
+        raise _fail(
+            "--polish rewrites entries with a model, and the local backend is "
+            "rule-based. Use --backend nim or --backend ollama, or drop --polish."
+        )
     client = _make_client(config, state) if polish else None
 
     try:

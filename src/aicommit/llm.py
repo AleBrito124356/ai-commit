@@ -5,6 +5,11 @@ Both backends speak the same ``/chat/completions`` shape, so a single tiny
 (``backend: nim`` or ``backend: ollama``) — the diff never leaves the backend
 you choose, and with Ollama it never leaves your machine.
 
+A third backend, ``local``, uses no model at all: it drafts messages with
+transparent rules (see :mod:`aicommit.heuristic`). Every backend offers the
+same ``complete`` method (:class:`Backend`); the local one additionally offers
+``draft_commit`` / ``draft_pr``, which the callers use instead of prompting.
+
 This module also owns the defensive parsing of model replies: reasoning blocks
 (``<think>...</think>``) are stripped and the first JSON object that actually
 parses is extracted with a string-aware brace scanner, so prose or stray braces
@@ -24,6 +29,11 @@ from typing import Any, Iterable, Iterator, List, Optional
 
 import httpx
 
+try:
+    from typing import Protocol
+except ImportError:  # pragma: no cover - Python < 3.8
+    Protocol = object  # type: ignore[assignment,misc]
+
 from .config import Config
 
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -42,7 +52,8 @@ _SIGNUP_HINT = (
     "  1. Create a free account at https://build.nvidia.com (takes ~2 minutes).\n"
     "  2. Generate an API key — it starts with 'nvapi-'.\n"
     "  3. Export it:  export NVIDIA_API_KEY=nvapi-...\n"
-    "Or run fully local instead:  aicommit --backend ollama"
+    "Or run fully local instead:  aicommit --backend ollama\n"
+    "Or draft without any model:  aicommit --backend local"
 )
 
 # Indirection so tests can patch the sleep without slowing the suite down.
@@ -51,6 +62,23 @@ _sleep = time.sleep
 
 class LLMError(RuntimeError):
     """Any failure talking to the backend, with a user-facing message."""
+
+
+class Backend(Protocol):
+    """What commit / PR / changelog generation needs from a backend."""
+
+    backend: str
+    model: str
+
+    def complete(
+        self, system: str, user: str, temperature: float = 0.3, max_tokens: int = 1024
+    ) -> str:  # pragma: no cover - protocol signature
+        ...
+
+
+def is_local_backend(client: Any) -> bool:
+    """True for the rule-based backend, which drafts from the diff directly."""
+    return callable(getattr(client, "draft_commit", None))
 
 
 @dataclass
@@ -69,7 +97,17 @@ class LLMClient:
     last_attempts: int = field(default=0, repr=False)
 
     @classmethod
-    def from_config(cls, config: Config, timeout: float = 60.0) -> "LLMClient":
+    def from_config(cls, config: Config, timeout: float = 60.0) -> Any:
+        """Build the backend selected in ``config``.
+
+        Returns an :class:`LLMClient` for ``nim`` and ``ollama`` and the
+        rule-based :class:`aicommit.heuristic.LocalBackend` for ``local``.
+        """
+        if config.backend == "local":
+            from .heuristic import LocalBackend  # lazy: heuristic imports commit
+
+            return LocalBackend()
+
         if config.backend == "nim":
             api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
             if not api_key:
@@ -249,7 +287,8 @@ class LLMClient:
             return (
                 f"Could not reach Ollama at {self.base_url}.\n"
                 "  Start it with:  ollama serve\n"
-                f"  Pull the model:  ollama pull {self.model}"
+                f"  Pull the model:  ollama pull {self.model}\n"
+                "  Or draft without any model:  aicommit --backend local"
             )
         return f"Could not reach {self.backend} at {self.base_url}."
 
